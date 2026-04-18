@@ -630,9 +630,17 @@ pub fn ArcAlignedUnmanaged(comptime T: type, comptime alignment: u29) type {
 
         /// Decrements the reference count, deallocating if the weak count reaches zero.
         /// The continued use of the pointer after calling `release` is undefined behaviour.
+        ///
+        /// Decrements use `.release` so every store to the value is visible to any
+        /// thread that subsequently synchronises.  An `.acquire` load on the just-zeroed
+        /// counter - taken only by the thread that drives the count to zero -
+        /// synchronises with all prior releases so the destructor and allocator see the
+        /// full write history.
         pub fn release(self: Self, allocator: Allocator) void {
-            if (@atomicRmw(usize, self.strong(), .Sub, 1, .acq_rel) == 1) {
-                if (@atomicRmw(usize, self.weak(), .Sub, 1, .acq_rel) == 1) {
+            if (@atomicRmw(usize, self.strong(), .Sub, 1, .release) == 1) {
+                _ = @atomicLoad(usize, self.strong(), .acquire);
+                if (@atomicRmw(usize, self.weak(), .Sub, 1, .release) == 1) {
+                    _ = @atomicLoad(usize, self.weak(), .acquire);
                     destroy(allocator, self.value);
                 }
             }
@@ -642,9 +650,11 @@ pub fn ArcAlignedUnmanaged(comptime T: type, comptime alignment: u29) type {
         /// and returning the underlying value if the strong count reaches zero.
         /// The continued use of the pointer after calling this method is undefined behaviour.
         pub fn releaseUnwrap(self: Self, allocator: Allocator) ?T {
-            if (@atomicRmw(usize, self.strong(), .Sub, 1, .acq_rel) == 1) {
+            if (@atomicRmw(usize, self.strong(), .Sub, 1, .release) == 1) {
+                _ = @atomicLoad(usize, self.strong(), .acquire);
                 const value = self.value.*;
-                if (@atomicRmw(usize, self.weak(), .Sub, 1, .acq_rel) == 1) {
+                if (@atomicRmw(usize, self.weak(), .Sub, 1, .release) == 1) {
+                    _ = @atomicLoad(usize, self.weak(), .acquire);
                     destroy(allocator, self.value);
                 }
                 return value;
@@ -657,9 +667,11 @@ pub fn ArcAlignedUnmanaged(comptime T: type, comptime alignment: u29) type {
         /// This will succeed even if there are outstanding weak references.
         /// The continued use of the pointer if the method successfully returns `T` is undefined behaviour.
         pub fn tryUnwrap(self: Self, allocator: Allocator) ?T {
-            if (@cmpxchgStrong(usize, self.strong(), 1, 0, .monotonic, .monotonic) == null) {
+            if (@cmpxchgStrong(usize, self.strong(), 1, 0, .release, .monotonic) == null) {
+                _ = @atomicLoad(usize, self.strong(), .acquire);
                 const tmp = self.value.*;
-                if (@atomicRmw(usize, self.weak(), .Sub, 1, .acq_rel) == 1) {
+                if (@atomicRmw(usize, self.weak(), .Sub, 1, .release) == 1) {
+                    _ = @atomicLoad(usize, self.weak(), .acquire);
                     destroy(allocator, self.value);
                 }
                 return tmp;
@@ -680,8 +692,12 @@ pub fn ArcAlignedUnmanaged(comptime T: type, comptime alignment: u29) type {
             inner: ?*align(internal_alignment) anyopaque = null,
 
             /// Creates a new weak reference.
+            ///
+            /// Uses `.monotonic` ordering on the weak-count increment: the
+            /// same reasoning as `ArcAlignedUnmanaged.retain` applies,
+            /// cloning a handle establishes no payload ordering.
             pub fn init(parent: ArcAlignedUnmanaged(T, alignment)) Weak {
-                _ = @atomicRmw(usize, parent.weak(), .Add, 1, .acq_rel);
+                _ = @atomicRmw(usize, parent.weak(), .Add, 1, .monotonic);
                 return Weak{ .inner = @ptrCast(parent.value) };
             }
 
@@ -728,7 +744,8 @@ pub fn ArcAlignedUnmanaged(comptime T: type, comptime alignment: u29) type {
                 while (true) {
                     const prev = @atomicLoad(usize, ptrToStrong(ptr), .acquire);
                     if (prev == 0) {
-                        if (@atomicRmw(usize, ptrToWeak(ptr), .Sub, 1, .acq_rel) == 1) {
+                        if (@atomicRmw(usize, ptrToWeak(ptr), .Sub, 1, .release) == 1) {
+                            _ = @atomicLoad(usize, ptrToWeak(ptr), .acquire);
                             destroy(allocator, ptr);
                             self.inner = null;
                         }
@@ -747,7 +764,8 @@ pub fn ArcAlignedUnmanaged(comptime T: type, comptime alignment: u29) type {
             /// The continued use of the pointer after calling `release` is undefined behaviour.
             pub fn release(self: Weak, allocator: Allocator) void {
                 if (self.value()) |ptr| {
-                    if (@atomicRmw(usize, ptrToWeak(ptr), .Sub, 1, .acq_rel) == 1) {
+                    if (@atomicRmw(usize, ptrToWeak(ptr), .Sub, 1, .release) == 1) {
+                        _ = @atomicLoad(usize, ptrToWeak(ptr), .acquire);
                         destroy(allocator, ptr);
                     }
                 }
